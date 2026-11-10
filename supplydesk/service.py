@@ -28,11 +28,8 @@ class OrderService:  # all the business rules live here
             "order_id": "ORD-" + str(state["next_order_number"]).zfill(4),  # like ORD-0001
             "status": "placed",  # every new order starts as placed
             **quote,  # copy in all the quote fields
-        }  # end of the dictionary
-        for line in order["items"]:  # go through each item line
-            for product in state["catalog"]:  # find the matching product
-                if product["product_id"] == line["product_id"]:  # same product id
-                    product["stock"] -= line["quantity"]  # take the units out of stock
+        }  # end of the order
+        self._change_stock(state, order["items"], -1)  # take the units out of stock
         state["next_order_number"] += 1  # next order gets the next number
         state["orders"].append(order)  # add to history
         self.store.save(state)  # write everything to the save file
@@ -42,68 +39,22 @@ class OrderService:  # all the business rules live here
         return self.store.load()["orders"]  # includes cancelled ones too
 
     def get_order(self, order_id):  # find one order by its id
-        state = self.store.load()  # get the saved orders
-        for order in state["orders"]:  # look through each order
-            if order["order_id"] == order_id:  # found it
-                return order  # send it back
-        raise ValueError("Unknown order: " + order_id)  # no order with that id
+        return self._find_order(self.store.load(), order_id)  # helper does the searching
 
     def cancel_order(self, order_id):  # cancels an order and puts stock back
         state = self.store.load()  # get the saved state
-        order = None  # will hold the order if we find it
-        for candidate in state["orders"]:  # look through each order
-            if candidate["order_id"] == order_id:  # found the right one
-                order = candidate  # keep it
-                break  # stop looking
-        if order is None:  # never found it
-            raise ValueError("Unknown order: " + order_id)  # unknown id is an error
-        for line in order["items"]:  # go through each item in the order
-            for product in state["catalog"]:  # find the matching product
-                if product["product_id"] == line["product_id"]:  # same product id
-                    product["stock"] += line["quantity"]  # put the units back
+        order = self._find_order(state, order_id)  # errors if the id doesnt exist
+        self._change_stock(state, order["items"], 1)  # put the units back
         order["status"] = "cancelled"  # mark it cancelled but keep it in history
         self.store.save(state)  # save the changes
         return order  # send back the cancelled order
 
     def _build_quote(self, state, customer_type, items, fulfillment):  # shared by quote and place_order so the rules only live once
-        if customer_type not in ("regular", "student"):  # only these two types exist
-            raise ValueError("Customer type must be regular or student.")  # reject the request
-        if fulfillment not in ("pickup", "delivery"):  # only these two options exist
-            raise ValueError("Fulfillment must be pickup or delivery.")  # reject the request
-        if not isinstance(items, list) or not items:  # needs a list with at least one item
-            raise ValueError("An order must contain at least one item.")  # reject the request
-        lines = []  # the priced item lines
-        subtotal = 0  # running total before discount
-        for item in items:  # check and price each item
-            if not isinstance(item, dict):  # every item has to be a dictionary
-                raise ValueError("Each item must contain a product_id and quantity.")  # reject the request
-            product = None  # will hold the product if we find it
-            for candidate in state["catalog"]:  # look through the catalog
-                if candidate["product_id"] == item.get("product_id"):  # found the product
-                    product = candidate  # keep it
-                    break  # stop looking
-            if product is None:  # product id doesnt exist
-                raise ValueError("Unknown product.")  # reject the request
-            quantity = item.get("quantity")  # how many they want
-            if type(quantity) is not int or quantity < MIN_QUANTITY or quantity > MAX_QUANTITY:  # whole number in range only
-                raise ValueError("Quantity must be an integer from 1 to 99.")  # reject the request
-            if quantity > product["stock"]:  # not enough left
-                raise ValueError("Not enough stock for " + product["product_id"] + ".")  # reject the request
-            line_total = product["unit_price_cents"] * quantity  # price for this line
-            subtotal += line_total  # add it to the subtotal
-            lines.append({  # save the line details
-                "product_id": product["product_id"],  # product id
-                "name": product["name"],  # product name
-                "unit_price_cents": product["unit_price_cents"],  # price for one
-                "quantity": quantity,  # how many
-                "line_total_cents": line_total,  # price times quantity
-            })  # end of the line
-        discount = 0  # no discount by default
-        if customer_type == "student" and subtotal > STUDENT_DISCOUNT_MIN_CENTS:  # student discount check
-            discount = (subtotal * STUDENT_DISCOUNT_PERCENT + 50) // 100  # adding 50 rounds half a cent up
-        delivery = 0  # pickup is free
-        if fulfillment == "delivery" and subtotal - discount < FREE_DELIVERY_MIN_CENTS:  # delivery under $100 costs extra
-            delivery = DELIVERY_FEE_CENTS  # add the delivery fee
+        self._check_request(customer_type, items, fulfillment)  # make sure the basics are valid first
+        lines = [self._price_line(state, item) for item in items]  # check and price every item
+        subtotal = sum(line["line_total_cents"] for line in lines)  # add up all the lines
+        discount = self._calculate_discount(customer_type, subtotal)  # student discount if any
+        delivery = self._calculate_delivery(fulfillment, subtotal - discount)  # delivery fee if any
         return {  # everything the quote needs
             "customer_type": customer_type,  # regular or student
             "fulfillment": fulfillment,  # pickup or delivery
@@ -112,4 +63,58 @@ class OrderService:  # all the business rules live here
             "discount_cents": discount,  # student discount
             "delivery_cents": delivery,  # delivery fee
             "total_cents": subtotal - discount + delivery,  # final price
-        }  # end of the dictionary
+        }  # end of the quote
+
+    def _check_request(self, customer_type, items, fulfillment):  # checks everything except the items themselves
+        if customer_type not in ("regular", "student"):  # only these two types exist
+            raise ValueError("Customer type must be regular or student.")  # bad customer type
+        if fulfillment not in ("pickup", "delivery"):  # only these two options exist
+            raise ValueError("Fulfillment must be pickup or delivery.")  # bad fulfillment
+        if not isinstance(items, list) or not items:  # needs a list with at least one item
+            raise ValueError("An order must contain at least one item.")  # empty or wrong type
+
+    def _price_line(self, state, item):  # checks one item and works out its price
+        if not isinstance(item, dict):  # every item has to be a dictionary
+            raise ValueError("Each item must contain a product_id and quantity.")  # wrong item shape
+        product = self._find_product(state, item.get("product_id"))  # look up the product
+        if product is None:  # product id doesnt exist
+            raise ValueError("Unknown product.")  # fake product
+        quantity = item.get("quantity")  # how many they want
+        if type(quantity) is not int or quantity < MIN_QUANTITY or quantity > MAX_QUANTITY:  # whole number in range only
+            raise ValueError("Quantity must be an integer from 1 to 99.")  # bad quantity
+        if quantity > product["stock"]:  # not enough left for this line
+            raise ValueError("Not enough stock for " + product["product_id"] + ".")  # out of stock
+        return {  # the priced line
+            "product_id": product["product_id"],  # product id
+            "name": product["name"],  # product name
+            "unit_price_cents": product["unit_price_cents"],  # price for one
+            "quantity": quantity,  # how many
+            "line_total_cents": product["unit_price_cents"] * quantity,  # price times quantity
+        }  # end of the line
+
+    def _calculate_discount(self, customer_type, subtotal):  # works out the student discount
+        if customer_type == "student" and subtotal > STUDENT_DISCOUNT_MIN_CENTS:  # student discount check
+            return (subtotal * STUDENT_DISCOUNT_PERCENT + 50) // 100  # adding 50 rounds half a cent up
+        return 0  # everyone else gets nothing
+
+    def _calculate_delivery(self, fulfillment, discounted_subtotal):  # works out the delivery fee
+        if fulfillment == "delivery" and discounted_subtotal < FREE_DELIVERY_MIN_CENTS:  # delivery under $100 costs extra
+            return DELIVERY_FEE_CENTS  # charge the fee
+        return 0  # pickup or big orders are free
+
+    def _find_product(self, state, product_id):  # finds a product in the catalog
+        for product in state["catalog"]:  # look through every product
+            if product["product_id"] == product_id:  # found the one we want
+                return product  # send it back
+        return None  # no product with that id
+
+    def _find_order(self, state, order_id):  # finds an order in the history
+        for order in state["orders"]:  # look through each order
+            if order["order_id"] == order_id:  # found it
+                return order  # send it back
+        raise ValueError("Unknown order: " + order_id)  # no order with that id
+
+    def _change_stock(self, state, lines, direction):  # negative direction takes stock out and positve puts it back
+        for line in lines:  # go through each item line
+            product = self._find_product(state, line["product_id"])  # find the product
+            product["stock"] += direction * line["quantity"]  # update the stock count
