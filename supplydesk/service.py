@@ -7,6 +7,7 @@ MAX_QUANTITY = 99  # biggest amount you can order of one item
 STUDENT_DISCOUNT_MIN_CENTS = 5000  # subtotal needed for the student discont
 STUDENT_DISCOUNT_PERCENT = 10  # students get 10 percent off
 DELIVERY_FEE_CENTS = 600  # delivery costs $6
+EXPRESS_FEE_CENTS = 1200  # express always costs $12 and is never free
 FREE_DELIVERY_MIN_CENTS = 10000  # delivery is free at $100 after the discount
 
 
@@ -68,8 +69,8 @@ class OrderService:  # all the business rules live here
     def _check_request(self, customer_type, items, fulfillment):  # checks everything except the items themselves
         if customer_type not in ("regular", "student"):  # only these two types exist
             raise ValueError("Customer type must be regular or student.")  # bad customer type
-        if fulfillment not in ("pickup", "delivery"):  # only these two options exist
-            raise ValueError("Fulfillment must be pickup or delivery.")  # bad fulfillment
+        if fulfillment not in ("pickup", "delivery", "express"):  # only these three options exist
+            raise ValueError("Fulfillment must be pickup, delivery or express.")  # bad fulfillment
         if not isinstance(items, list) or not items:  # needs a list with at least one item
             raise ValueError("An order must contain at least one item.")  # empty or wrong type
 
@@ -98,9 +99,11 @@ class OrderService:  # all the business rules live here
         return 0  # everyone else gets nothing
 
     def _calculate_delivery(self, fulfillment, discounted_subtotal):  # works out the delivery fee
+        if fulfillment == "express":  # express is a flat fee no matter the total
+            return EXPRESS_FEE_CENTS  # never waived
         if fulfillment == "delivery" and discounted_subtotal < FREE_DELIVERY_MIN_CENTS:  # delivery under $100 costs extra
             return DELIVERY_FEE_CENTS  # charge the fee
-        return 0  # pickup or big orders are free
+        return 0  # pickup or big standard orders are free
 
     def _find_product(self, state, product_id):  # finds a product in the catalog
         for product in state["catalog"]:  # look through every product
